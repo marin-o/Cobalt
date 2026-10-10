@@ -350,24 +350,48 @@ fn key_test(seconds: &str) -> Result<(), Box<dyn Error>> {
     // grabbed, so the process ending leaves the devices exactly as found.
     let (sender, events) = mpsc::channel();
     for (label, path) in sources {
-        let mut device = std::fs::File::open(&path)?;
-        let name = kobo_abi::input::device_name(&device)?;
+        // The button node is what the test is for, so failing to open it ends
+        // the test. The power node is extra: a reader where it cannot be
+        // opened still has buttons worth capturing.
+        let opened = std::fs::File::open(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|device| {
+                kobo_abi::input::device_name(&device)
+                    .map(|name| (device, name))
+                    .map_err(|error| error.to_string())
+            });
+        let (mut device, name) = match opened {
+            Ok(opened) => opened,
+            Err(error) if label == "power" => {
+                println!(
+                    "power device: {} unavailable ({error}); reading buttons only",
+                    path.display()
+                );
+                continue;
+            }
+            Err(error) => return Err(format!("{label} device {}: {error}", path.display()).into()),
+        };
         println!("{label} device: {} ({name})", path.display());
         let sender = sender.clone();
         std::thread::spawn(move || {
             let mut buffer = [0_u8; 16 * 64];
             loop {
-                let Ok(read) = device.read(&mut buffer) else {
-                    return;
+                let read = match device.read(&mut buffer) {
+                    Ok(0) => {
+                        let _ = sender.send(Err((label, "the device closed".to_owned())));
+                        return;
+                    }
+                    Ok(read) => read,
+                    Err(error) => {
+                        let _ = sender.send(Err((label, error.to_string())));
+                        return;
+                    }
                 };
-                if read == 0 {
-                    return;
-                }
                 for chunk in buffer[..read].chunks_exact(16) {
                     let Some(event) = InputEvent32::decode(chunk) else {
                         continue;
                     };
-                    if sender.send((label, event)).is_err() {
+                    if sender.send(Ok((label, event))).is_err() {
                         return;
                     }
                 }
@@ -381,8 +405,18 @@ fn key_test(seconds: &str) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
     let mut count = 0_u32;
     while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-        let Ok((label, event)) = events.recv_timeout(remaining) else {
+        let Ok(message) = events.recv_timeout(remaining) else {
             break;
+        };
+        let (label, event) = match message {
+            Ok(received) => received,
+            Err(("power", error)) => {
+                println!("power device stopped: {error}; still reading buttons");
+                continue;
+            }
+            Err((label, error)) => {
+                return Err(format!("{label} device failed after {count} events: {error}").into());
+            }
         };
         count += 1;
         let at = started.elapsed().as_millis();
@@ -498,7 +532,12 @@ fn restart_reader(state: &Path) -> Result<(), Box<dyn Error>> {
         Ok(())
     };
     match kobo_hal::probe_device() {
-        Ok(snapshot) => match kobo_profile::write_ready_profile(&snapshot) {
+        // Recovery undoes what a session changed, and an owner can run a
+        // session on a profile that is not yet write-ready, so the hardware
+        // facts of the profile that claims this reader are enough here.
+        Ok(snapshot) => match kobo_profile::write_ready_profile(&snapshot)
+            .or_else(|blockers| kobo_profile::claimed_profile(&snapshot).ok_or(blockers))
+        {
             Ok(profile) => {
                 light_recovery = kobo_hal::frontlight::Frontlight::recover(state)
                     .map_err(|error| format!("front light recovery failed: {error}"))

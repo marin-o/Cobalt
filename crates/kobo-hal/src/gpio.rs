@@ -128,7 +128,46 @@ fn discover_buttons_path_from(content: &str) -> Option<PathBuf> {
     discover_named_path_from(content, DEVICE_NAME)
 }
 
-/// Finds the Tolino Shine 5's separate power-key node, if present.
+/// True when the `gpio-keys` device advertises `KEY_POWER` itself.
+///
+/// Read from the `B: KEY=` capability bitmap in `/proc/bus/input/devices`.
+/// Readers whose power key lives on a separate PMIC node report only the
+/// cover key here.
+#[must_use]
+pub fn buttons_report_power() -> bool {
+    std::fs::read_to_string("/proc/bus/input/devices").is_ok_and(|content| {
+        named_device_reports_key(&content, DEVICE_NAME, input::KEY_POWER, usize::BITS)
+    })
+}
+
+/// Whether the named device's `B: KEY=` bitmap has `code` set. The kernel
+/// prints the bitmap as `unsigned long` words, most significant first, so the
+/// word width is the target's.
+fn named_device_reports_key(content: &str, name: &str, code: u16, word_bits: u32) -> bool {
+    let wanted = format!("N: Name=\"{name}\"");
+    content.split("\n\n").any(|block| {
+        block.lines().any(|line| line == wanted)
+            && block
+                .lines()
+                .find_map(|line| line.strip_prefix("B: KEY="))
+                .is_some_and(|bitmap| bitmap_has(bitmap, code, word_bits))
+    })
+}
+
+fn bitmap_has(bitmap: &str, code: u16, word_bits: u32) -> bool {
+    let words = bitmap.split_whitespace().collect::<Vec<_>>();
+    let word_bits = word_bits as usize;
+    let index = usize::from(code) / word_bits;
+    let bit = usize::from(code) % word_bits;
+    words
+        .len()
+        .checked_sub(1 + index)
+        .and_then(|position| words.get(position))
+        .and_then(|word| u64::from_str_radix(word, 16).ok())
+        .is_some_and(|word| (word >> bit) & 1 == 1)
+}
+
+/// Finds the separate `bd71828-pwrkey` power-key node, if present.
 #[must_use]
 pub fn discover_power_path() -> Option<PathBuf> {
     let content = std::fs::read_to_string("/proc/bus/input/devices").ok()?;
@@ -205,23 +244,20 @@ impl GpioSession {
     /// Returns an error when the device cannot be opened or is not
     /// `gpio-keys`.
     pub fn acquire(path: &Path) -> Result<Self, GpioError> {
-        Self::acquire_named(path, DEVICE_NAME, false)
+        Self::acquire_named(path, DEVICE_NAME)
     }
 
-    /// Opens the separate power-key device and forwards only power events.
+    /// Opens the separate power-key device. It reports nothing but
+    /// `KEY_POWER`, so its stream needs no filtering.
     ///
     /// # Errors
     ///
     /// Returns an error when the node cannot be opened or has another name.
     pub fn acquire_power(path: &Path) -> Result<Self, GpioError> {
-        Self::acquire_named(path, POWER_DEVICE_NAME, true)
+        Self::acquire_named(path, POWER_DEVICE_NAME)
     }
 
-    fn acquire_named(
-        path: &Path,
-        expected: &'static str,
-        power_only: bool,
-    ) -> Result<Self, GpioError> {
+    fn acquire_named(path: &Path, expected: &'static str) -> Result<Self, GpioError> {
         let device = File::open(path)?;
         let name = input::device_name(&device)?;
         if name != expected {
@@ -245,17 +281,6 @@ impl GpioSession {
                     let Some(event) = InputEvent32::decode(chunk).and_then(decode) else {
                         continue;
                     };
-                    if power_only
-                        && !matches!(
-                            event,
-                            GpioEvent::Button {
-                                button: Button::Power,
-                                ..
-                            }
-                        )
-                    {
-                        continue;
-                    }
                     if sender.send(event).is_err() {
                         return;
                     }
@@ -278,8 +303,8 @@ impl GpioSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode, discover_buttons_path_from, discover_power_path_from, Button, GpioEvent,
-        Orientation,
+        decode, discover_buttons_path_from, discover_power_path_from, named_device_reports_key,
+        Button, GpioEvent, Orientation,
     };
     use crate::touch::InputEvent32;
     use std::path::Path;
@@ -412,5 +437,24 @@ B: KEY=100000 0 0 0\n";
             discover_power_path_from(fixture).as_deref(),
             Some(Path::new("/dev/input/event2"))
         );
+    }
+
+    #[test]
+    fn the_power_key_bit_is_read_from_the_capability_bitmap() {
+        // Captured from the T302: gpio-keys carries only key 35 (the cover),
+        // the PMIC node only key 116 (power). 32-bit words on the device.
+        let fixture = "N: Name=\"gpio-keys\"\n\
+H: Handlers=event0 perfmgr\n\
+B: KEY=8 0\n\n\
+N: Name=\"bd71828-pwrkey\"\n\
+H: Handlers=event2 perfmgr\n\
+B: KEY=100000 0 0 0\n";
+        assert!(!named_device_reports_key(fixture, "gpio-keys", 116, 32));
+        assert!(named_device_reports_key(fixture, "gpio-keys", 35, 32));
+        assert!(named_device_reports_key(fixture, "bd71828-pwrkey", 116, 32));
+        // The same bit printed with 64-bit words.
+        let wide = "N: Name=\"gpio-keys\"\nB: KEY=10000000000000 0\n";
+        assert!(named_device_reports_key(wide, "gpio-keys", 116, 64));
+        assert!(!named_device_reports_key("", "gpio-keys", 116, 32));
     }
 }

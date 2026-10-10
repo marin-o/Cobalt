@@ -254,11 +254,7 @@ impl Identity {
     /// and is the one non-Kobo shape accepted.
     #[must_use]
     pub fn is_kobo(&self) -> bool {
-        let bytes = self.serial.as_bytes();
-        bytes.len() >= 4
-            && (((bytes[0] == b'N' || bytes[0] == b'P')
-                && bytes[1..4].iter().all(u8::is_ascii_digit))
-                || bytes.starts_with(b"T302"))
+        kobo_profile::is_matchable_serial(&self.serial)
     }
 
     /// The four-character model code, which is what a device profile matches.

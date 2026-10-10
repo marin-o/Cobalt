@@ -144,6 +144,27 @@ impl Mounted {
 /// Returns a hardware- or firmware-specific refusal, or an ambiguity error if
 /// profile data ever stops being unique.
 pub fn install_profile(reader: &Mounted) -> Result<&'static kobo_profile::DeviceProfile, String> {
+    install_or_undo_profile(reader, false)
+}
+
+/// Picks the profile to name a reader by while removing Cobalt from it.
+///
+/// Removal only takes back what Cobalt put on the reader, so it is not gated
+/// on write evidence or on the firmware: a reader whose profile awaits
+/// review, or whose firmware has moved on, must still be able to return to
+/// stock. The hardware must still be one a profile describes.
+///
+/// # Errors
+///
+/// Returns a refusal when no profile describes this model code.
+pub fn undo_profile(reader: &Mounted) -> Result<&'static kobo_profile::DeviceProfile, String> {
+    install_or_undo_profile(reader, true)
+}
+
+fn install_or_undo_profile(
+    reader: &Mounted,
+    undo: bool,
+) -> Result<&'static kobo_profile::DeviceProfile, String> {
     let hardware = kobo_profile::SUPPORTED_PROFILES
         .iter()
         .copied()
@@ -154,6 +175,13 @@ pub fn install_profile(reader: &Mounted) -> Result<&'static kobo_profile::Device
             "unsupported Kobo hardware: model code {} has no reviewed Cobalt profile",
             reader.model_code()
         ));
+    }
+    if undo {
+        return Ok(hardware
+            .iter()
+            .copied()
+            .find(|profile| profile.accepts_firmware(&reader.firmware))
+            .unwrap_or(hardware[0]));
     }
     // Checked before the model's own branches, and named for the reason rather
     // than the symptom. Falling through to "reviewed branches: 4.45" would be
@@ -227,10 +255,7 @@ pub fn parse_version(line: &str) -> (String, String) {
 /// non-Kobo shape accepted.
 #[must_use]
 pub fn is_kobo_serial(serial: &str) -> bool {
-    let bytes = serial.as_bytes();
-    bytes.len() >= 4
-        && (((bytes[0] == b'N' || bytes[0] == b'P') && bytes[1..4].iter().all(u8::is_ascii_digit))
-            || bytes.starts_with(b"T302"))
+    kobo_profile::is_matchable_serial(serial)
 }
 
 /// Every place a removable volume is mounted on this operating system.
@@ -1997,6 +2022,19 @@ mod tests {
         };
         let refusal = install_profile(&tolino).expect_err("T302 awaiting review");
         assert!(refusal.contains("not enabled for installation"));
+        // Removal is not gated on review: an owner can always get back to stock.
+        assert_eq!(
+            super::undo_profile(&tolino).map(|profile| profile.id),
+            Ok("tolino-shine-5-t302")
+        );
+        let moved_on = Mounted {
+            firmware: "4.46.23836".to_owned(),
+            ..tolino
+        };
+        assert_eq!(
+            super::undo_profile(&moved_on).map(|profile| profile.id),
+            Ok("tolino-shine-5-t302")
+        );
     }
 
     #[test]

@@ -746,18 +746,19 @@ pub fn present(
         pump_gpio(session, &taps);
     }
 
-    // T302 reports KEY_POWER on a separate PMIC input node. Its gpio-keys
-    // node carries the cover signal but no power key, so listening only there
-    // makes the physical button appear dead during a Cobalt session.
+    // Readers on the BD71828 PMIC (the T302, and per `cover.rs` the Clara BW)
+    // report KEY_POWER on a separate `bd71828-pwrkey` node, while gpio-keys
+    // carries the cover signal and no power key. Listening only there makes
+    // the physical button appear dead during a Cobalt session. The node is
+    // opened whenever it exists and gpio-keys does not already report the
+    // power key, so no reader can receive one press twice.
     let mut power_key = None;
-    if profile.serial_prefix == "T302" {
+    if !gpio::buttons_report_power() {
         if let Some(path) = gpio::discover_power_path() {
             match GpioSession::acquire_power(&path) {
                 Ok(session) => power_key = Some(session),
                 Err(error) => trace(&format!("power key unavailable: {error}")),
             }
-        } else {
-            trace("power key unavailable: bd71828-pwrkey not found");
         }
     }
     if let Some(session) = power_key.as_mut() {
